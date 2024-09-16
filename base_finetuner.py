@@ -25,9 +25,7 @@ from transformers import (
     TrainerCallback,
 )
 
-from transformers import DataCollatorForT5MLM
-from sentence_transformers import SentenceTransformer, models, InputExample, losses
-from torch.utils.data import DataLoader
+from sentence_transformers import SentenceTransformer, models
 
 MODEL_NAME = 'thenlper/gte-base'
 # Can also use other popular models like 
@@ -126,58 +124,105 @@ class Finetuner:
     def finetune_model(output_model_name="finetuned_model", document_sample_count=1000, 
                        file_path="encoded_texts.json", model_name=MODEL_NAME, 
                        per_device_train_batch_size=8, use_fp16=False, finetuner_instance=None):
-        # Load the model and tokenizer
-        model = AutoModelForSeq2SeqLM.from_pretrained(model_name)
+        """
+        Finetunes a pre-trained language model on a custom dataset.
+        """
+        config = AutoConfig.from_pretrained(model_name)
+        if config.model_type == 't5':
+            model = T5EncoderModel.from_pretrained(model_name)
+            is_t5 = True
+        else:
+            model = AutoModelForMaskedLM.from_pretrained(model_name)
+            is_t5 = False
         tokenizer = AutoTokenizer.from_pretrained(model_name)
-        
+        output_dir = f"output/{output_model_name}-{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}"
+
         # Load and preprocess the dataset
         with open(file_path) as f:
             dataset = [json.loads(e) for e in f.read().split("\n") if e]
         train_sentences = [e["text"] for e in dataset]
         np.random.shuffle(train_sentences)
         train_sentences = train_sentences[:document_sample_count]
-        
-        # Create a Hugging Face Dataset
-        tokenized_dataset = Dataset.from_dict({"text": train_sentences})
-        
-        # Define the data collator for T5
-        data_collator = DataCollatorForT5MLM(
-            tokenizer=tokenizer,
-            noise_density=0.15,
-            mean_noise_span_length=3,
-            input_length=tokenizer.model_max_length,
-            target_length=tokenizer.model_max_length,
+
+        if is_t5:
+            # Prepare dataset for sequence-to-sequence training
+            def preprocess_function(examples):
+                inputs = examples['text']
+                model_inputs = tokenizer(inputs, max_length=tokenizer.model_max_length, truncation=True, padding='max_length')
+                # Use the same text as labels
+                labels = tokenizer(inputs, max_length=tokenizer.model_max_length, truncation=True, padding='max_length')
+                model_inputs["labels"] = labels["input_ids"]
+                return model_inputs
+
+            tokenized_datasets = DatasetDict({
+                "train": Dataset.from_dict({"text": train_sentences})
+            })
+            lm_datasets = tokenized_datasets.map(
+                preprocess_function,
+                batched=True,
+                remove_columns=["text"],
+            )
+        else:
+            # Original MLM tokenization and grouping
+            tokenized_inputs = tokenizer(train_sentences, padding='max_length', truncation=True, max_length=tokenizer.model_max_length)
+            tokenized_datasets = DatasetDict({
+                "train": Dataset.from_dict(tokenized_inputs)
+            })
+            # Group texts into chunks
+            def group_texts(examples):
+                concatenated_examples = {k: sum(examples[k], []) for k in examples.keys()}
+                total_length = len(concatenated_examples[list(examples.keys())[0]])
+                total_length = (total_length // tokenizer.model_max_length) * tokenizer.model_max_length
+                result = {
+                    k: [t[i : i + tokenizer.model_max_length] for i in range(0, total_length, tokenizer.model_max_length)]
+                    for k, t in concatenated_examples.items()
+                }
+                result["labels"] = result["input_ids"].copy()
+                return result
+
+            lm_datasets = tokenized_datasets.map(group_texts, batched=True)
+
+        # Split dataset
+        train_size = int(0.9 * len(lm_datasets["train"]))
+        test_size = len(lm_datasets["train"]) - train_size
+        split_dataset = lm_datasets["train"].train_test_split(
+            train_size=train_size, test_size=test_size, seed=42
         )
-        
-        # Tokenize the dataset
-        def preprocess_function(examples):
-            inputs = tokenizer(examples['text'], max_length=tokenizer.model_max_length, truncation=True, padding='max_length')
-            return inputs
-        
-        tokenized_dataset = tokenized_dataset.map(preprocess_function, batched=True, remove_columns=["text"])
-        
-        # Split the dataset
-        train_size = int(0.9 * len(tokenized_dataset))
-        test_size = len(tokenized_dataset) - train_size
-        split_dataset = tokenized_dataset.train_test_split(train_size=train_size, test_size=test_size, seed=42)
-        
-        # Training arguments
+
+        # Calculate total steps and save_steps to have 10 checkpoints
+        total_steps = (train_size * 10) // (per_device_train_batch_size)  # Assuming num_train_epochs=10
+        save_steps = max(1, total_steps // 10)
+
+        # Update training arguments
         training_args = TrainingArguments(
-            output_dir=output_model_name,
+            output_dir=output_dir,
+            gradient_checkpointing=False,
+            gradient_accumulation_steps=4,  # Adjust as needed
             overwrite_output_dir=True,
             num_train_epochs=10,
+            learning_rate=2e-5,
+            weight_decay=0.01,
             per_device_train_batch_size=per_device_train_batch_size,
             per_device_eval_batch_size=per_device_train_batch_size,
             fp16=use_fp16,
+            save_steps=save_steps,
+            logging_steps=save_steps,
             evaluation_strategy="steps",
-            save_steps=500,
-            eval_steps=500,
-            logging_steps=500,
+            eval_steps=save_steps,
             load_best_model_at_end=True,
-            save_total_limit=2,
+            save_total_limit=10,  # Limit to 10 checkpoints
         )
-        
-        # Initialize the Trainer
+
+        # Prepare data collator
+        if is_t5:
+            data_collator = DataCollatorForSeq2Seq(tokenizer, model=model)
+        else:
+            data_collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm_probability=0.15)
+
+        # Prepare results dictionary
+        results_dict = {}
+
+        # Initialize the trainer
         trainer = Trainer(
             model=model,
             args=training_args,
@@ -185,17 +230,47 @@ class Finetuner:
             eval_dataset=split_dataset["test"],
             data_collator=data_collator,
             tokenizer=tokenizer,
+            callbacks=[
+                EarlyStoppingCallback(early_stopping_patience=3),
+                EvaluationCallback(
+                    finetuner_instance=finetuner_instance,
+                    model_name=model_name,
+                    output_dir=output_dir,
+                    file_path=file_path,
+                    results_dict=results_dict
+                )
+            ]
         )
-        
+
         # Start training
         trainer.train()
-        
-        # Save the final model
-        model.save_pretrained(output_model_name)
-        tokenizer.save_pretrained(output_model_name)
-        
-        print(f"Training done and model saved to: {output_model_name}")
-        return output_model_name
+
+        # Save final model
+        model.save_pretrained(output_dir)
+        tokenizer.save_pretrained(output_dir)
+
+        # Convert to SentenceTransformer model
+        if is_t5:
+            word_embedding_model = models.Transformer(output_dir)
+        else:
+            word_embedding_model = models.Transformer(output_dir)
+        pooling_model = models.Pooling(word_embedding_model.get_word_embedding_dimension(), pooling_mode='mean')
+        sentence_model = SentenceTransformer(modules=[word_embedding_model, pooling_model])
+        final_model_path = output_dir + "_finetuned"
+        sentence_model.save(final_model_path)
+
+        # Save final evaluation result
+        final_evaluation = finetuner_instance.evaluate_model(
+            SentenceTransformer(final_model_path), file_path=file_path
+        )
+        results_dict[f"{model_name}_final"] = final_evaluation
+
+        # Save all results
+        with open(os.path.join(output_dir, "final_results.json"), "w") as f:
+            json.dump(results_dict, f, indent=4)
+
+        print(f"Training done and model saved to: {final_model_path}")
+        return output_dir, final_model_path
 
     @staticmethod
     def manual_encode_from_trained_mlm(text, output_dir):
