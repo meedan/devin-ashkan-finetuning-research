@@ -16,6 +16,7 @@ from transformers import (
     AutoConfig,
     AutoTokenizer,
     AutoModel,
+    DataCollatorForSeq2Seq,
     DataCollatorForLanguageModeling,
     Trainer,
     TrainingArguments,
