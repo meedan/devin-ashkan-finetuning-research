@@ -18,6 +18,7 @@ from transformers import (
     AutoModel,
     DataCollatorForSeq2Seq,
     DataCollatorForLanguageModeling,
+    T5EncoderModel,
     Trainer,
     TrainingArguments,
     EarlyStoppingCallback,
@@ -128,7 +129,7 @@ class Finetuner:
         """
         config = AutoConfig.from_pretrained(model_name)
         if config.model_type == 't5':
-            model = AutoModelForSeq2SeqLM.from_pretrained(model_name)
+            model = T5EncoderModel.from_pretrained(model_name)
             is_t5 = True
         else:
             model = AutoModelForMaskedLM.from_pretrained(model_name)
@@ -250,7 +251,7 @@ class Finetuner:
 
         # Convert to SentenceTransformer model
         if is_t5:
-            word_embedding_model = models.Transformer(output_dir, model_args={'is_encoder_decoder': True})
+            word_embedding_model = models.Transformer(output_dir)
         else:
             word_embedding_model = models.Transformer(output_dir)
         pooling_model = models.Pooling(word_embedding_model.get_word_embedding_dimension(), pooling_mode='mean')
