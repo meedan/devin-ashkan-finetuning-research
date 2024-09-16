@@ -122,7 +122,7 @@ class Finetuner:
     @staticmethod
     def finetune_model(output_model_name="finetuned_model", document_sample_count=1000, 
                        file_path="encoded_texts.json", model_name=MODEL_NAME, 
-                       per_device_train_batch_size=8, use_fp16=True, finetuner_instance=None):
+                       per_device_train_batch_size=8, use_fp16=False, finetuner_instance=None):
         """
         Finetunes a pre-trained language model on a custom dataset.
         """
@@ -195,7 +195,7 @@ class Finetuner:
         # Update training arguments
         training_args = TrainingArguments(
             output_dir=output_dir,
-            gradient_checkpointing=True,
+            gradient_checkpointing=False,
             gradient_accumulation_steps=4,  # Adjust as needed
             overwrite_output_dir=True,
             num_train_epochs=10,
