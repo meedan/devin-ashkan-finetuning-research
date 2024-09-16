@@ -13,6 +13,7 @@ import torch
 from transformers import (
     AutoModelForSeq2SeqLM,
     AutoModelForMaskedLM,
+    AutoConfig,
     AutoTokenizer,
     AutoModel,
     DataCollatorForLanguageModeling,
