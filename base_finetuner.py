@@ -11,6 +11,7 @@ from datasets import Dataset, DatasetDict
 from torch import Tensor
 import torch
 from transformers import (
+    AutoModelForSeq2SeqLM,
     AutoModelForMaskedLM,
     AutoTokenizer,
     AutoModel,
@@ -122,50 +123,61 @@ class Finetuner:
                        per_device_train_batch_size=64, use_fp16=True, finetuner_instance=None):
         """
         Finetunes a pre-trained language model on a custom dataset.
-
-        Args:
-            output_model_name (str): Name for the output model.
-            document_sample_count (int): Number of documents to use for finetuning.
-            file_path (str): Path to the encoded texts JSON file.
-            model_name (str): Name of the pre-trained model to finetune.
-            per_device_train_batch_size (int): Batch size per device during training.
-            use_fp16 (bool): Whether to use 16-bit floating-point precision.
-            finetuner_instance (Finetuner): Instance of Finetuner class for callbacks.
-
-        Returns:
-            str: Path to the directory where the trained model is saved.
-            str: Path to the directory where the finetuned SentenceTransformer model is saved.
         """
-        model = AutoModelForMaskedLM.from_pretrained(model_name)
+        config = AutoConfig.from_pretrained(model_name)
+        if config.model_type == 't5':
+            model = AutoModelForSeq2SeqLM.from_pretrained(model_name)
+            is_t5 = True
+        else:
+            model = AutoModelForMaskedLM.from_pretrained(model_name)
+            is_t5 = False
         tokenizer = AutoTokenizer.from_pretrained(model_name)
         output_dir = f"output/{output_model_name}-{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}"
-        
+
         # Load and preprocess the dataset
         with open(file_path) as f:
             dataset = [json.loads(e) for e in f.read().split("\n") if e]
         train_sentences = [e["text"] for e in dataset]
         np.random.shuffle(train_sentences)
         train_sentences = train_sentences[:document_sample_count]
-        
-        # Tokenization
-        tokenized_inputs = tokenizer(train_sentences, padding='max_length', truncation=True, max_length=tokenizer.model_max_length)
-        tokenized_datasets = DatasetDict({
-            "train": Dataset.from_dict(tokenized_inputs)
-        })
-        
-        # Group texts into chunks
-        def group_texts(examples):
-            concatenated_examples = {k: sum(examples[k], []) for k in examples.keys()}
-            total_length = len(concatenated_examples[list(examples.keys())[0]])
-            total_length = (total_length // tokenizer.model_max_length) * tokenizer.model_max_length
-            result = {
-                k: [t[i : i + tokenizer.model_max_length] for i in range(0, total_length, tokenizer.model_max_length)]
-                for k, t in concatenated_examples.items()
-            }
-            result["labels"] = result["input_ids"].copy()
-            return result
 
-        lm_datasets = tokenized_datasets.map(group_texts, batched=True)
+        if is_t5:
+            # Prepare dataset for sequence-to-sequence training
+            def preprocess_function(examples):
+                inputs = examples['text']
+                model_inputs = tokenizer(inputs, max_length=tokenizer.model_max_length, truncation=True, padding='max_length')
+                # Use the same text as labels
+                labels = tokenizer(inputs, max_length=tokenizer.model_max_length, truncation=True, padding='max_length')
+                model_inputs["labels"] = labels["input_ids"]
+                return model_inputs
+
+            tokenized_datasets = DatasetDict({
+                "train": Dataset.from_dict({"text": train_sentences})
+            })
+            lm_datasets = tokenized_datasets.map(
+                preprocess_function,
+                batched=True,
+                remove_columns=["text"],
+            )
+        else:
+            # Original MLM tokenization and grouping
+            tokenized_inputs = tokenizer(train_sentences, padding='max_length', truncation=True, max_length=tokenizer.model_max_length)
+            tokenized_datasets = DatasetDict({
+                "train": Dataset.from_dict(tokenized_inputs)
+            })
+            # Group texts into chunks
+            def group_texts(examples):
+                concatenated_examples = {k: sum(examples[k], []) for k in examples.keys()}
+                total_length = len(concatenated_examples[list(examples.keys())[0]])
+                total_length = (total_length // tokenizer.model_max_length) * tokenizer.model_max_length
+                result = {
+                    k: [t[i : i + tokenizer.model_max_length] for i in range(0, total_length, tokenizer.model_max_length)]
+                    for k, t in concatenated_examples.items()
+                }
+                result["labels"] = result["input_ids"].copy()
+                return result
+
+            lm_datasets = tokenized_datasets.map(group_texts, batched=True)
 
         # Split dataset
         train_size = int(0.9 * len(lm_datasets["train"]))
@@ -196,8 +208,12 @@ class Finetuner:
             save_total_limit=10,  # Limit to 10 checkpoints
         )
 
-        data_collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm_probability=0.15)
-        
+        # Prepare data collator
+        if is_t5:
+            data_collator = DataCollatorForSeq2Seq(tokenizer, model=model)
+        else:
+            data_collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm_probability=0.15)
+
         # Prepare results dictionary
         results_dict = {}
 
@@ -229,7 +245,10 @@ class Finetuner:
         tokenizer.save_pretrained(output_dir)
 
         # Convert to SentenceTransformer model
-        word_embedding_model = models.Transformer(output_dir)
+        if is_t5:
+            word_embedding_model = models.Transformer(output_dir, model_args={'is_encoder_decoder': True})
+        else:
+            word_embedding_model = models.Transformer(output_dir)
         pooling_model = models.Pooling(word_embedding_model.get_word_embedding_dimension(), pooling_mode='mean')
         sentence_model = SentenceTransformer(modules=[word_embedding_model, pooling_model])
         final_model_path = output_dir + "_finetuned"
