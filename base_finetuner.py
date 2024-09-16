@@ -391,7 +391,7 @@ class Finetuner:
         Returns:
             dict: A dictionary containing results for all models and sample sizes.
         """
-        model_names = ['sentence-transformers/gtr-t5-xl', 'sentence-transformers/gtr-t5-large', 'sentence-transformers/gtr-t5-base']
+        model_names = ['sentence-transformers/gtr-t5-base', 'sentence-transformers/gtr-t5-large', 'sentence-transformers/gtr-t5-xl']
         overall_results = {}
 
         for model_name in model_names:
