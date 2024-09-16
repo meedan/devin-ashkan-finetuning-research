@@ -1,4 +1,5 @@
 import json
+import os
 from datetime import datetime
 import numpy as np
 import pandas as pd
@@ -8,14 +9,16 @@ import xgboost as xgb
 from datasets import Dataset, DatasetDict
 
 from torch import Tensor
-
+import torch
 from transformers import (
     AutoModelForMaskedLM,
     AutoTokenizer,
+    AutoModel,
     DataCollatorForLanguageModeling,
     Trainer,
     TrainingArguments,
-    EarlyStoppingCallback
+    EarlyStoppingCallback,
+    TrainerCallback,
 )
 
 from sentence_transformers import SentenceTransformer, models
@@ -23,6 +26,48 @@ from sentence_transformers import SentenceTransformer, models
 MODEL_NAME = 'thenlper/gte-base'
 # Can also use other popular models like 
 # google-bert/bert-base-uncased and sentence-transformers/all-MiniLM-L6-v2
+
+class EvaluationCallback(TrainerCallback):
+    """
+    Custom callback to evaluate the model at each checkpoint.
+    """
+    def __init__(self, finetuner_instance, model_name, output_dir, file_path, results_dict):
+        self.finetuner_instance = finetuner_instance
+        self.model_name = model_name
+        self.output_dir = output_dir
+        self.file_path = file_path
+        self.results_dict = results_dict
+        self.checkpoint_counter = 0
+
+    def on_save(self, args, state, control, **kwargs):
+        # Increment checkpoint counter
+        self.checkpoint_counter += 1
+        checkpoint_dir = os.path.join(self.output_dir, f"{self.model_name}_checkpoint_{self.checkpoint_counter}")
+
+        # Save the current model and tokenizer
+        kwargs['model'].save_pretrained(checkpoint_dir)
+        kwargs['tokenizer'].save_pretrained(checkpoint_dir)
+
+        # Convert to SentenceTransformer model
+        word_embedding_model = models.Transformer(checkpoint_dir)
+        pooling_model = models.Pooling(word_embedding_model.get_word_embedding_dimension(), pooling_mode='mean')
+        sentence_model = SentenceTransformer(modules=[word_embedding_model, pooling_model])
+        finetuned_model_path = checkpoint_dir + "_finetuned"
+        sentence_model.save(finetuned_model_path)
+
+        # Evaluate the model
+        evaluation_result = self.finetuner_instance.evaluate_model(
+            SentenceTransformer(finetuned_model_path), file_path=self.file_path
+        )
+
+        # Store the results
+        self.results_dict[f"{self.model_name}_checkpoint_{self.checkpoint_counter}"] = evaluation_result
+
+        # Save intermediate results
+        with open(os.path.join(self.output_dir, "intermediate_results.json"), "w") as f:
+            json.dump(self.results_dict, f, indent=4)
+
+        print(f"Checkpoint {self.checkpoint_counter} evaluation completed.")
 
 class Finetuner:
     @staticmethod
@@ -37,10 +82,10 @@ class Finetuner:
         Returns:
             dict: A dictionary containing R² score, median absolute error, and mean absolute error.
         """
-        dataset = [json.loads(e) for e in open(file_path).read().split("\n")[:-1]]
+        dataset = [json.loads(e) for e in open(file_path).read().split("\n") if e]
         np.random.shuffle(dataset)
         dataset = dataset[:20000]
-        embeddings = transformer.encode([e["text"] for e in dataset])
+        embeddings = transformer.encode([e["text"] for e in dataset], show_progress_bar=False)
         encoded_texts = []
         for i, row in enumerate(dataset):
             encoded_texts.append({"id": row["id"]["$oid"], "price": row["price"], "embedding": embeddings[i]})
@@ -48,9 +93,9 @@ class Finetuner:
         model = xgb.XGBRegressor(
             n_estimators=500,
             device='cuda',
-            n_jobs=500
+            n_jobs=4
         )
-        embeddings = pd.DataFrame([e["embedding"] for e in encoded_texts])
+        embeddings_df = pd.DataFrame([e["embedding"] for e in encoded_texts])
         target = pd.DataFrame([e["price"] for e in encoded_texts])
         ids = pd.DataFrame([e["id"] for e in encoded_texts])
         y_preds = []
@@ -58,7 +103,7 @@ class Finetuner:
         actual_ids = []
         kf = KFold(n_splits=5)
         for train_index, test_index in kf.split(target):
-            X_train, X_test = embeddings.iloc[train_index], embeddings.iloc[test_index]
+            X_train, X_test = embeddings_df.iloc[train_index], embeddings_df.iloc[test_index]
             y_train, y_test = target.iloc[train_index], target.iloc[test_index]
             id_train, id_test = ids.iloc[train_index], ids.iloc[test_index]
             actual_ids.extend(id_test.values.flatten())
@@ -70,11 +115,11 @@ class Finetuner:
             "median": np.median(np.abs(np.array(actual_ys) - y_preds)),
             "mean": np.mean(np.abs(np.array(actual_ys) - y_preds))
         }
-    
+
     @staticmethod
     def finetune_model(output_model_name="finetuned_model", document_sample_count=1000, 
                        file_path="encoded_texts.json", model_name=MODEL_NAME, 
-                       per_device_train_batch_size=64, save_steps=1000, use_fp16=True):
+                       per_device_train_batch_size=64, use_fp16=True, finetuner_instance=None):
         """
         Finetunes a pre-trained language model on a custom dataset.
 
@@ -84,8 +129,8 @@ class Finetuner:
             file_path (str): Path to the encoded texts JSON file.
             model_name (str): Name of the pre-trained model to finetune.
             per_device_train_batch_size (int): Batch size per device during training.
-            save_steps (int): Number of steps between saving checkpoints.
             use_fp16 (bool): Whether to use 16-bit floating-point precision.
+            finetuner_instance (Finetuner): Instance of Finetuner class for callbacks.
 
         Returns:
             str: Path to the directory where the trained model is saved.
@@ -93,8 +138,49 @@ class Finetuner:
         """
         model = AutoModelForMaskedLM.from_pretrained(model_name)
         tokenizer = AutoTokenizer.from_pretrained(model_name)
+        output_dir = f"output/{output_model_name}-{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}"
+        
+        # Load and preprocess the dataset
+        with open(file_path) as f:
+            dataset = [json.loads(e) for e in f.read().split("\n") if e]
+        train_sentences = [e["text"] for e in dataset]
+        np.random.shuffle(train_sentences)
+        train_sentences = train_sentences[:document_sample_count]
+        
+        # Tokenization
+        tokenized_inputs = tokenizer(train_sentences, padding='max_length', truncation=True, max_length=tokenizer.model_max_length)
+        tokenized_datasets = DatasetDict({
+            "train": Dataset.from_dict(tokenized_inputs)
+        })
+        
+        # Group texts into chunks
+        def group_texts(examples):
+            concatenated_examples = {k: sum(examples[k], []) for k in examples.keys()}
+            total_length = len(concatenated_examples[list(examples.keys())[0]])
+            total_length = (total_length // tokenizer.model_max_length) * tokenizer.model_max_length
+            result = {
+                k: [t[i : i + tokenizer.model_max_length] for i in range(0, total_length, tokenizer.model_max_length)]
+                for k, t in concatenated_examples.items()
+            }
+            result["labels"] = result["input_ids"].copy()
+            return result
+
+        lm_datasets = tokenized_datasets.map(group_texts, batched=True)
+
+        # Split dataset
+        train_size = int(0.9 * len(lm_datasets["train"]))
+        test_size = len(lm_datasets["train"]) - train_size
+        split_dataset = lm_datasets["train"].train_test_split(
+            train_size=train_size, test_size=test_size, seed=42
+        )
+
+        # Calculate total steps and save_steps to have 10 checkpoints
+        total_steps = (train_size * 10) // (per_device_train_batch_size)  # Assuming num_train_epochs=10
+        save_steps = max(1, total_steps // 10)
+
+        # Update training arguments
         training_args = TrainingArguments(
-            output_dir=f"output/{output_model_name}-{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}",
+            output_dir=output_dir,
             overwrite_output_dir=True,
             num_train_epochs=10,
             learning_rate=2e-5,
@@ -107,57 +193,61 @@ class Finetuner:
             evaluation_strategy="steps",
             eval_steps=save_steps,
             load_best_model_at_end=True,
+            save_total_limit=10,  # Limit to 10 checkpoints
         )
-        if document_sample_count:
-            data_collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm_probability=0.15)
-            with open(file_path) as f:
-                dataset = [json.loads(e) for e in f.read().split("\n")[:-1]]
-            train_sentences = [e["text"] for e in dataset]
-            np.random.shuffle(train_sentences)
-            tokenized_inputs = tokenizer(train_sentences[:document_sample_count], padding=True, truncation=True, return_tensors="pt")
-            tokenized_datasets = DatasetDict({
-                "train": Dataset.from_dict({
-                    "input_ids": tokenized_inputs["input_ids"],
-                    "attention_mask": tokenized_inputs["attention_mask"]
-                })
-            })
-            chunk_size = tokenizer.model_max_length
-            def group_texts(examples):
-                concatenated_examples = {k: sum(examples[k], []) for k in examples.keys()}
-                total_length = len(concatenated_examples[list(examples.keys())[0]])
-                total_length = (total_length // chunk_size) * chunk_size
-                result = {
-                    k: [t[i : i + chunk_size] for i in range(0, total_length, chunk_size)]
-                    for k, t in concatenated_examples.items()
-                }
-                result["labels"] = result["input_ids"].copy()
-                return result
-            lm_datasets = tokenized_datasets.map(group_texts, batched=True)
-            train_size = int(0.9 * document_sample_count)
-            test_size = int(0.1 * document_sample_count)
-            split_dataset = lm_datasets["train"].train_test_split(
-                train_size=train_size, test_size=test_size, seed=42
-            )
-            trainer = Trainer(
-                model=model,
-                args=training_args,
-                train_dataset=split_dataset["train"],
-                eval_dataset=split_dataset["test"],
-                data_collator=data_collator,
-                tokenizer=tokenizer,
-                callbacks=[EarlyStoppingCallback(early_stopping_patience=3)]
-            )
-            trainer.train()
-        model.save_pretrained(training_args.output_dir)
-        tokenizer.save_pretrained(training_args.output_dir)
-        word_embedding_model = models.Transformer(training_args.output_dir)
+
+        data_collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm_probability=0.15)
+        
+        # Prepare results dictionary
+        results_dict = {}
+
+        # Initialize the trainer
+        trainer = Trainer(
+            model=model,
+            args=training_args,
+            train_dataset=split_dataset["train"],
+            eval_dataset=split_dataset["test"],
+            data_collator=data_collator,
+            tokenizer=tokenizer,
+            callbacks=[
+                EarlyStoppingCallback(early_stopping_patience=3),
+                EvaluationCallback(
+                    finetuner_instance=finetuner_instance,
+                    model_name=model_name,
+                    output_dir=output_dir,
+                    file_path=file_path,
+                    results_dict=results_dict
+                )
+            ]
+        )
+
+        # Start training
+        trainer.train()
+
+        # Save final model
+        model.save_pretrained(output_dir)
+        tokenizer.save_pretrained(output_dir)
+
+        # Convert to SentenceTransformer model
+        word_embedding_model = models.Transformer(output_dir)
         pooling_model = models.Pooling(word_embedding_model.get_word_embedding_dimension(), pooling_mode='mean')
         sentence_model = SentenceTransformer(modules=[word_embedding_model, pooling_model])
-        final_model_path = training_args.output_dir+"_finetuned"
+        final_model_path = output_dir + "_finetuned"
         sentence_model.save(final_model_path)
+
+        # Save final evaluation result
+        final_evaluation = finetuner_instance.evaluate_model(
+            SentenceTransformer(final_model_path), file_path=file_path
+        )
+        results_dict[f"{model_name}_final"] = final_evaluation
+
+        # Save all results
+        with open(os.path.join(output_dir, "final_results.json"), "w") as f:
+            json.dump(results_dict, f, indent=4)
+
         print(f"Training done and model saved to: {final_model_path}")
-        return training_args.output_dir, final_model_path
-    
+        return output_dir, final_model_path
+
     @staticmethod
     def manual_encode_from_trained_mlm(text, output_dir):
         """
@@ -183,11 +273,12 @@ class Finetuner:
             truncation=True,
             return_tensors='pt'
         )
-        batch_dict.to("cuda")
-        tmp_model.to("cuda")
-        outputs = tmp_model(**batch_dict)
-        return average_pool(outputs.last_hidden_state, batch_dict['attention_mask']).tolist()[0]
-    
+        batch_dict = {k: v.to(tmp_model.device) for k, v in batch_dict.items()}
+        tmp_model.to(tmp_model.device)
+        with torch.no_grad():
+            outputs = tmp_model(**batch_dict)
+        return average_pool(outputs.last_hidden_state, batch_dict['attention_mask']).cpu().tolist()[0]
+
     @staticmethod
     def cosine_similarity_numpy(a, b):
         """
@@ -207,7 +298,7 @@ class Finetuner:
         b_norm = np.linalg.norm(b, axis=-1, keepdims=True)
         similarity = dot_product / (a_norm * b_norm.T)
         return similarity
-    
+
     @staticmethod
     def consistency_check(raw_output_dir, sentence_transformer_output_dir, input_text):
         """
@@ -219,13 +310,14 @@ class Finetuner:
             input_text (str): Input text for consistency checking.
         """
         loaded_model = SentenceTransformer(sentence_transformer_output_dir)
-        assert Finetuner.cosine_similarity_numpy(
+        similarity = Finetuner.cosine_similarity_numpy(
             Finetuner.manual_encode_from_trained_mlm(input_text, raw_output_dir),
             loaded_model.encode(input_text).tolist()
-        ) > 0.99
-    
+        )
+        assert similarity > 0.99, f"Consistency check failed: similarity={similarity}"
+
     @staticmethod
-    def run(finetune_document_sample_count=1000, file_path="encoded_texts.json"):
+    def run(finetune_document_sample_count=1000, file_path="encoded_texts.json", model_name=MODEL_NAME):
         """
         Runs the finetuning process and evaluates the model.
 
@@ -236,26 +328,75 @@ class Finetuner:
         Returns:
             dict: A dictionary containing the evaluation metrics (R², median, and mean absolute errors).
         """
-        raw_output_dir, sentence_transformer_output_dir = Finetuner.finetune_model(
+        finetuner_instance = Finetuner()
+        raw_output_dir, sentence_transformer_output_dir = finetuner_instance.finetune_model(
             document_sample_count=finetune_document_sample_count,
-            file_path=file_path
+            file_path=file_path,
+            model_name=model_name,
+            finetuner_instance=finetuner_instance,
+            output_model_name=f"{model_name.replace('/', '_')}_{finetune_document_sample_count}"
         )
-        Finetuner.consistency_check(raw_output_dir, sentence_transformer_output_dir, "hello world")
-        return Finetuner.evaluate_model(SentenceTransformer(sentence_transformer_output_dir), file_path=file_path)
-    
+        finetuner_instance.consistency_check(raw_output_dir, sentence_transformer_output_dir, "hello world")
+        return finetuner_instance.evaluate_model(SentenceTransformer(sentence_transformer_output_dir), file_path=file_path)
+
     @staticmethod
-    def full_finetuning_test():
+    def full_finetuning_test(model_name=MODEL_NAME):
         """
         Conducts a full finetuning test over a range of document sample sizes and stores the results.
 
         Returns:
             dict: A dictionary mapping sample sizes to their respective evaluation results.
         """
+        finetuner_instance = Finetuner()
         keyed_results = {}
-        for i in np.arange(0, 120000, 10000):
+        for i in range(0, 120001, 10000):
             if not keyed_results.get(str(i)):
-                test_result = Finetuner.run(i)
+                test_result = finetuner_instance.run(i, model_name=model_name)
                 keyed_results[str(i)] = test_result
-            with open("stored_results.json", "w") as f:
-                f.write(json.dumps(keyed_results))
+                with open(f"stored_results_{model_name.replace('/', '_')}.json", "w") as f:
+                    f.write(json.dumps(keyed_results, indent=4))
         return keyed_results
+
+    @staticmethod
+    def run_full_analysis(file_path="encoded_texts.json"):
+        """
+        Runs full analysis on multiple models and document sample sizes.
+
+        Args:
+            file_path (str): Path to the encoded texts JSON file.
+
+        Returns:
+            dict: A dictionary containing results for all models and sample sizes.
+        """
+        model_names = ['google/gtr-t5-xxl', 'google/gtr-t5-xl', 'google/gtr-t5-large']
+        overall_results = {}
+
+        for model_name in model_names:
+            print(f"Starting analysis for model: {model_name}")
+            finetuner_instance = Finetuner()
+            model_results = {}
+            for doc_count in range(10000, 120001, 10000):
+                print(f"Training with {doc_count} documents for model {model_name}")
+                raw_output_dir, sentence_transformer_output_dir = finetuner_instance.finetune_model(
+                    document_sample_count=doc_count,
+                    file_path=file_path,
+                    model_name=model_name,
+                    finetuner_instance=finetuner_instance,
+                    output_model_name=f"{model_name.replace('/', '_')}_{doc_count}"
+                )
+                finetuner_instance.consistency_check(raw_output_dir, sentence_transformer_output_dir, "hello world")
+                evaluation_result = finetuner_instance.evaluate_model(
+                    SentenceTransformer(sentence_transformer_output_dir), file_path=file_path
+                )
+                model_results[str(doc_count)] = evaluation_result
+                # Save intermediate results
+                with open(f"analysis_results_{model_name.replace('/', '_')}.json", "w") as f:
+                    json.dump(model_results, f, indent=4)
+            overall_results[model_name] = model_results
+            # Save results for each model
+            with open(f"analysis_results_{model_name.replace('/', '_')}.json", "w") as f:
+                json.dump(model_results, f, indent=4)
+        # Save overall results
+        with open("overall_analysis_results.json", "w") as f:
+            json.dump(overall_results, f, indent=4)
+        return overall_results
