@@ -129,7 +129,7 @@ class Finetuner:
         """
         config = AutoConfig.from_pretrained(model_name)
         if config.model_type == 't5':
-            model = T5EncoderModel.from_pretrained(model_name)
+            model = AutoModelForSeq2SeqLM.from_pretrained(model_name)
             is_t5 = True
         else:
             model = AutoModelForMaskedLM.from_pretrained(model_name)
