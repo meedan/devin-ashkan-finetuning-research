@@ -368,9 +368,8 @@ class Finetuner:
         Returns:
             dict: A dictionary containing results for all models and sample sizes.
         """
-        model_names = ['google/gtr-t5-xxl', 'google/gtr-t5-xl', 'google/gtr-t5-large']
+        model_names = ['google/gtr-t5-xl', 'google/gtr-t5-large', 'google/gtr-t5-base']
         overall_results = {}
-
         for model_name in model_names:
             print(f"Starting analysis for model: {model_name}")
             finetuner_instance = Finetuner()
