@@ -36,6 +36,7 @@ class EvaluationCallback(TrainerCallback):
     Custom callback to evaluate the model at each checkpoint and delete the checkpoint afterward.
     """
     def __init__(self, finetuner_instance, model_name, output_dir, file_path, results_dict, results_dir, model, tokenizer):
+        self.document_sample_count=document_sample_count
         self.finetuner_instance = finetuner_instance
         self.model_name = model_name
         self.output_dir = output_dir
@@ -72,11 +73,12 @@ class EvaluationCallback(TrainerCallback):
             **metrics,  # Include Trainer's evaluation metrics
             **evaluation_result,  # Include custom evaluation results
             "model_name": self.model_name,
-            "checkpoint_counter": self.checkpoint_counter
+            "checkpoint_counter": self.checkpoint_counter,
+            "document_sample_count": self.document_sample_count
         }
 
         # Store the results
-        self.results_dict[f"{self.model_name}_checkpoint_{self.checkpoint_counter}"] = combined_results
+        self.results_dict[f"{self.model_name}_checkpoint_{self.document_sample_count}_{self.checkpoint_counter}"] = combined_results
 
         # Save intermediate results to the results directory
         with open(os.path.join(self.results_dir, "intermediate_results.json"), "w") as f:
@@ -257,6 +259,7 @@ class Finetuner:
             callbacks=[
                 EarlyStoppingCallback(early_stopping_patience=3),
                 EvaluationCallback(
+                    document_sample_count=document_sample_count,
                     finetuner_instance=finetuner_instance,
                     model_name=model_name,
                     output_dir=output_dir,
@@ -303,7 +306,7 @@ class Finetuner:
         results_dict[f"{model_name}_final"] = combined_results
 
         # Save all results to the results directory
-        with open(os.path.join(results_dir, "final_results.json"), "w") as f:
+        with open(os.path.join(results_dir, f"final_results_{document_sample_count}.json"), "w") as f:
             json.dump(results_dict, f, indent=4)
 
         print(f"Training done and model saved to: {final_model_path}")
