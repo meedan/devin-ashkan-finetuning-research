@@ -33,7 +33,7 @@ MODEL_NAME = 'thenlper/gte-base'
 
 class EvaluationCallback(TrainerCallback):
     """
-    Custom callback to evaluate the model at each checkpoint.
+    Custom callback to evaluate the model at each checkpoint and delete the checkpoint afterward.
     """
     def __init__(self, finetuner_instance, model_name, output_dir, file_path, results_dict):
         self.finetuner_instance = finetuner_instance
@@ -58,7 +58,7 @@ class EvaluationCallback(TrainerCallback):
         sentence_model = SentenceTransformer(modules=[word_embedding_model, pooling_model])
         finetuned_model_path = checkpoint_dir + "_finetuned"
         sentence_model.save(finetuned_model_path)
-
+        import code;code.interact(local=dict(globals(), **locals())) 
         # Evaluate the model
         evaluation_result = self.finetuner_instance.evaluate_model(
             SentenceTransformer(finetuned_model_path), file_path=self.file_path
@@ -72,6 +72,17 @@ class EvaluationCallback(TrainerCallback):
             json.dump(self.results_dict, f, indent=4)
 
         print(f"Checkpoint {self.checkpoint_counter} evaluation completed.")
+
+        # Delete the checkpoint and finetuned model to save disk space
+        import shutil
+        try:
+            # Delete the checkpoint directory
+            shutil.rmtree(checkpoint_dir)
+            # Delete the finetuned model directory
+            shutil.rmtree(finetuned_model_path)
+            print(f"Deleted checkpoint and finetuned model at {checkpoint_dir} and {finetuned_model_path}")
+        except Exception as e:
+            print(f"Error deleting checkpoint directories: {e}")
 
 class Finetuner:
     @staticmethod
