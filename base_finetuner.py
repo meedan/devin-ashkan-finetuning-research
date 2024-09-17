@@ -35,8 +35,8 @@ class EvaluationCallback(TrainerCallback):
     """
     Custom callback to evaluate the model at each checkpoint and delete the checkpoint afterward.
     """
-    def __init__(self, finetuner_instance, model_name, output_dir, file_path, results_dict, results_dir, model, tokenizer):
-        self.document_sample_count=document_sample_count
+    def __init__(self, document_sample_count, finetuner_instance, model_name, output_dir, file_path, results_dict, results_dir, model, tokenizer):
+        self.document_sample_count = document_sample_count
         self.finetuner_instance = finetuner_instance
         self.model_name = model_name
         self.output_dir = output_dir
