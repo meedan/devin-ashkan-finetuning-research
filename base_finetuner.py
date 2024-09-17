@@ -35,22 +35,25 @@ class EvaluationCallback(TrainerCallback):
     """
     Custom callback to evaluate the model at each checkpoint and delete the checkpoint afterward.
     """
-    def __init__(self, finetuner_instance, model_name, output_dir, file_path, results_dict):
+    def __init__(self, finetuner_instance, model_name, output_dir, file_path, results_dict, results_dir, model, tokenizer):
         self.finetuner_instance = finetuner_instance
         self.model_name = model_name
         self.output_dir = output_dir
         self.file_path = file_path
         self.results_dict = results_dict
+        self.results_dir = results_dir
+        self.model = model
+        self.tokenizer = tokenizer
         self.checkpoint_counter = 0
 
-    def on_save(self, args, state, control, **kwargs):
+    def on_evaluate(self, args, state, control, metrics, **kwargs):
         # Increment checkpoint counter
         self.checkpoint_counter += 1
         checkpoint_dir = os.path.join(self.output_dir, f"{self.model_name}_checkpoint_{self.checkpoint_counter}")
 
         # Save the current model and tokenizer
-        kwargs['model'].save_pretrained(checkpoint_dir)
-        kwargs['tokenizer'].save_pretrained(checkpoint_dir)
+        self.model.save_pretrained(checkpoint_dir)
+        self.tokenizer.save_pretrained(checkpoint_dir)
 
         # Convert to SentenceTransformer model
         word_embedding_model = models.Transformer(checkpoint_dir)
@@ -58,17 +61,25 @@ class EvaluationCallback(TrainerCallback):
         sentence_model = SentenceTransformer(modules=[word_embedding_model, pooling_model])
         finetuned_model_path = checkpoint_dir + "_finetuned"
         sentence_model.save(finetuned_model_path)
-        import code;code.interact(local=dict(globals(), **locals())) 
+
         # Evaluate the model
         evaluation_result = self.finetuner_instance.evaluate_model(
             SentenceTransformer(finetuned_model_path), file_path=self.file_path
         )
 
-        # Store the results
-        self.results_dict[f"{self.model_name}_checkpoint_{self.checkpoint_counter}"] = evaluation_result
+        # Combine evaluation metrics and custom evaluation results
+        combined_results = {
+            **metrics,  # Include Trainer's evaluation metrics
+            **evaluation_result,  # Include custom evaluation results
+            "model_name": self.model_name,
+            "checkpoint_counter": self.checkpoint_counter
+        }
 
-        # Save intermediate results
-        with open(os.path.join(self.output_dir, "intermediate_results.json"), "w") as f:
+        # Store the results
+        self.results_dict[f"{self.model_name}_checkpoint_{self.checkpoint_counter}"] = combined_results
+
+        # Save intermediate results to the results directory
+        with open(os.path.join(self.results_dir, "intermediate_results.json"), "w") as f:
             json.dump(self.results_dict, f, indent=4)
 
         print(f"Checkpoint {self.checkpoint_counter} evaluation completed.")
@@ -76,9 +87,7 @@ class EvaluationCallback(TrainerCallback):
         # Delete the checkpoint and finetuned model to save disk space
         import shutil
         try:
-            # Delete the checkpoint directory
             shutil.rmtree(checkpoint_dir)
-            # Delete the finetuned model directory
             shutil.rmtree(finetuned_model_path)
             print(f"Deleted checkpoint and finetuned model at {checkpoint_dir} and {finetuned_model_path}")
         except Exception as e:
@@ -233,6 +242,10 @@ class Finetuner:
         # Prepare results dictionary
         results_dict = {}
 
+        # Specify the results directory
+        results_dir = 'results'
+        os.makedirs(results_dir, exist_ok=True)
+
         # Initialize the trainer
         trainer = Trainer(
             model=model,
@@ -248,7 +261,10 @@ class Finetuner:
                     model_name=model_name,
                     output_dir=output_dir,
                     file_path=file_path,
-                    results_dict=results_dict
+                    results_dict=results_dict,
+                    results_dir=results_dir,
+                    model=model,
+                    tokenizer=tokenizer
                 )
             ]
         )
@@ -257,27 +273,37 @@ class Finetuner:
         trainer.train()
 
         # Save final model
-        model.save_pretrained(output_dir)
+        trainer.save_model(output_dir)
         tokenizer.save_pretrained(output_dir)
 
         # Convert to SentenceTransformer model
-        if is_t5:
-            word_embedding_model = models.Transformer(output_dir)
-        else:
-            word_embedding_model = models.Transformer(output_dir)
+        word_embedding_model = models.Transformer(output_dir)
         pooling_model = models.Pooling(word_embedding_model.get_word_embedding_dimension(), pooling_mode='mean')
         sentence_model = SentenceTransformer(modules=[word_embedding_model, pooling_model])
         final_model_path = output_dir + "_finetuned"
         sentence_model.save(final_model_path)
 
-        # Save final evaluation result
+        # Evaluate the final model
         final_evaluation = finetuner_instance.evaluate_model(
             SentenceTransformer(final_model_path), file_path=file_path
         )
-        results_dict[f"{model_name}_final"] = final_evaluation
 
-        # Save all results
-        with open(os.path.join(output_dir, "final_results.json"), "w") as f:
+        # Get final evaluation metrics from the trainer
+        final_metrics = trainer.evaluate()
+
+        # Combine final evaluation results and metrics
+        combined_results = {
+            **final_metrics,
+            **final_evaluation,
+            "model_name": model_name,
+            "checkpoint_counter": "final"
+        }
+
+        # Store the final results
+        results_dict[f"{model_name}_final"] = combined_results
+
+        # Save all results to the results directory
+        with open(os.path.join(results_dir, "final_results.json"), "w") as f:
             json.dump(results_dict, f, indent=4)
 
         print(f"Training done and model saved to: {final_model_path}")
