@@ -284,24 +284,55 @@ class Finetuner:
         Returns:
             list: The embedding vector for the input text.
         """
-        def average_pool(last_hidden_states: Tensor,
-                         attention_mask: Tensor) -> Tensor:
+        def average_pool(last_hidden_states: Tensor, attention_mask: Tensor) -> Tensor:
             last_hidden = last_hidden_states.masked_fill(~attention_mask[..., None].bool(), 0.0)
             return last_hidden.sum(dim=1) / attention_mask.sum(dim=1)[..., None]
+    
         tmp_tokenizer = AutoTokenizer.from_pretrained(output_dir)
-        tmp_model = AutoModel.from_pretrained(output_dir)
-        batch_dict = tmp_tokenizer(
-            [text],
-            max_length=tmp_tokenizer.model_max_length,
-            padding=True,
-            truncation=True,
-            return_tensors='pt'
-        )
-        batch_dict = {k: v.to(tmp_model.device) for k, v in batch_dict.items()}
-        tmp_model.to(tmp_model.device)
-        with torch.no_grad():
-            outputs = tmp_model(**batch_dict)
-        return average_pool(outputs.last_hidden_state, batch_dict['attention_mask']).cpu().tolist()[0]
+        config = AutoConfig.from_pretrained(output_dir)
+    
+        if config.model_type == 't5':
+            # Load the full model
+            tmp_model = AutoModelForSeq2SeqLM.from_pretrained(output_dir)
+            tmp_model.to(tmp_model.device)
+        
+            # Tokenize the input text
+            batch_dict = tmp_tokenizer(
+                [text],
+                max_length=tmp_tokenizer.model_max_length,
+                padding=True,
+                truncation=True,
+                return_tensors='pt'
+            )
+            batch_dict = {k: v.to(tmp_model.device) for k, v in batch_dict.items()}
+        
+            with torch.no_grad():
+                # Use the encoder directly
+                encoder_outputs = tmp_model.encoder(
+                    input_ids=batch_dict['input_ids'],
+                    attention_mask=batch_dict['attention_mask'],
+                    return_dict=True
+                )
+                last_hidden_state = encoder_outputs.last_hidden_state
+        else:
+            tmp_model = AutoModel.from_pretrained(output_dir)
+            tmp_model.to(tmp_model.device)
+        
+            batch_dict = tmp_tokenizer(
+                [text],
+                max_length=tmp_tokenizer.model_max_length,
+                padding=True,
+                truncation=True,
+                return_tensors='pt'
+            )
+            batch_dict = {k: v.to(tmp_model.device) for k, v in batch_dict.items()}
+        
+            with torch.no_grad():
+                outputs = tmp_model(**batch_dict)
+                last_hidden_state = outputs.last_hidden_state
+    
+        # Perform average pooling
+        return average_pool(last_hidden_state, batch_dict['attention_mask']).cpu().tolist()[0]
 
     @staticmethod
     def cosine_similarity_numpy(a, b):
