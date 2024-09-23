@@ -470,7 +470,7 @@ class Finetuner:
             print(f"Starting analysis for model: {model_name}")
             finetuner_instance = Finetuner()
             model_results = {}
-            for doc_count in range(40000, 120001, 10000):
+            for doc_count in range(100000, 120001, 10000):
                 print(f"Training with {doc_count} documents for model {model_name}")
                 raw_output_dir, sentence_transformer_output_dir = finetuner_instance.finetune_model(
                     document_sample_count=doc_count,
